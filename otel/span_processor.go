@@ -4,6 +4,7 @@ package sentryotel
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -12,19 +13,62 @@ import (
 	otelSdkTrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-type sentrySpanProcessor struct{}
+type sentrySpanProcessor struct {
+	beforeCreate BeforeCreateFn
+	afterEnd     AfterEndFn
+}
 
-// Singleton instance of the Sentry span processor.
-// At the moment we do not support multiple instances.
-var sentrySpanProcessorInstance *sentrySpanProcessor
+var linkTraceContextOnce sync.Once
 
-func NewSentrySpanProcessor() otelSdkTrace.SpanProcessor {
-	if sentrySpanProcessorInstance != nil {
-		return sentrySpanProcessorInstance
+type SentrySpanProcessorOption func(*sentrySpanProcessorOptions)
+
+type sentrySpanProcessorOptions struct {
+	ssp *sentrySpanProcessor
+}
+
+func NewSentrySpanProcessor(options ...SentrySpanProcessorOption) otelSdkTrace.SpanProcessor {
+	ssp := &sentrySpanProcessor{}
+	opts := sentrySpanProcessorOptions{ssp: ssp}
+	for _, opt := range options {
+		opt(&opts)
 	}
-	sentry.AddGlobalEventProcessor(linkTraceContextToErrorEvent)
-	sentrySpanProcessorInstance := &sentrySpanProcessor{}
-	return sentrySpanProcessorInstance
+
+	linkTraceContextOnce.Do(func() {
+		sentry.AddGlobalEventProcessor(linkTraceContextToErrorEvent)
+	})
+
+	return ssp
+}
+
+func WithBeforeCreate(fn BeforeCreateFn) SentrySpanProcessorOption {
+	return func(opts *sentrySpanProcessorOptions) { opts.ssp.beforeCreate = fn }
+}
+
+func WithAfterEnd(fn AfterEndFn) SentrySpanProcessorOption {
+	return func(opts *sentrySpanProcessorOptions) { opts.ssp.afterEnd = fn }
+}
+
+type BeforeCreateFn func(*BeforeCreateContext)
+type AfterEndFn func(*AfterEndContext)
+
+type BeforeCreateContext struct {
+	Context  context.Context
+	OtelSpan otelSdkTrace.ReadWriteSpan
+	Parent   *sentry.Span
+	sampled  sentry.Sampled
+}
+
+func (b *BeforeCreateContext) Sampled() sentry.Sampled {
+	return b.sampled
+}
+
+func (b *BeforeCreateContext) SetSampled(v sentry.Sampled) {
+	b.sampled = v
+}
+
+type AfterEndContext struct {
+	OtelSpan otelSdkTrace.ReadOnlySpan
+	Span     *sentry.Span
 }
 
 // https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/sdk.md#onstart
@@ -40,17 +84,44 @@ func (ssp *sentrySpanProcessor) OnStart(parent context.Context, s otelSdkTrace.R
 	}
 
 	if sentryParentSpan != nil {
-		span := sentryParentSpan.StartChild(s.Name())
+		sampled := sentry.SampledUndefined
+
+		if ssp.beforeCreate != nil {
+			before := BeforeCreateContext{
+				Context:  parent,
+				OtelSpan: s,
+				Parent:   sentryParentSpan,
+				sampled:  sampled,
+			}
+			ssp.beforeCreate(&before)
+			sampled = before.sampled
+		}
+
+		span := sentryParentSpan.StartChild(s.Name(), sentry.WithSpanSampled(sampled))
 		span.SpanID = sentry.SpanID(otelSpanID)
 		span.StartTime = s.StartTime()
 
 		sentrySpanMap.Set(otelSpanID, span)
 	} else {
 		traceParentContext := getTraceParentContext(parent)
+
+		sampled := traceParentContext.Sampled
+
+		if ssp.beforeCreate != nil {
+			before := BeforeCreateContext{
+				Context:  parent,
+				OtelSpan: s,
+				Parent:   nil,
+				sampled:  sampled,
+			}
+			ssp.beforeCreate(&before)
+			sampled = before.sampled
+		}
+
 		transaction := sentry.StartTransaction(
 			parent,
 			s.Name(),
-			sentry.WithSpanSampled(traceParentContext.Sampled),
+			sentry.WithSpanSampled(sampled),
 		)
 		transaction.SpanID = sentry.SpanID(otelSpanID)
 		transaction.TraceID = sentry.TraceID(otelTraceID)
@@ -68,12 +139,14 @@ func (ssp *sentrySpanProcessor) OnStart(parent context.Context, s otelSdkTrace.R
 func (ssp *sentrySpanProcessor) OnEnd(s otelSdkTrace.ReadOnlySpan) {
 	otelSpanId := s.SpanContext().SpanID()
 	sentrySpan, ok := sentrySpanMap.Get(otelSpanId)
+	if ok {
+		defer sentrySpanMap.Delete(otelSpanId)
+	}
 	if !ok || sentrySpan == nil {
 		return
 	}
 
 	if utils.IsSentryRequestSpan(sentrySpan.Context(), s) {
-		sentrySpanMap.Delete(otelSpanId)
 		return
 	}
 
@@ -84,9 +157,15 @@ func (ssp *sentrySpanProcessor) OnEnd(s otelSdkTrace.ReadOnlySpan) {
 	}
 
 	sentrySpan.EndTime = s.EndTime()
-	sentrySpan.Finish()
 
-	sentrySpanMap.Delete(otelSpanId)
+	defer sentrySpan.Finish()
+
+	if ssp.afterEnd != nil {
+		ssp.afterEnd(&AfterEndContext{
+			OtelSpan: s,
+			Span:     sentrySpan,
+		})
+	}
 }
 
 // https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/sdk.md#shutdown-1
